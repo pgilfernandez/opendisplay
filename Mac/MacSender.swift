@@ -167,6 +167,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
+    private var loggedRemoteInput = false
     private var inputInjector: InputInjector? {
         willSet { inputInjector?.releaseRemoteInput() }
     }
@@ -440,20 +441,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 canvasNeedsRebuild = false
                 await reconfigure(latest)
             }
+        }
 
-            // Touch back-channel (Milestone 3). Needs Accessibility trust;
-            // streaming works without it, so don't interrupt with a prompt —
-            // the permission panel's Grant button asks when the user is ready.
-            if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for remote input")
-                // Event posting is trust-checked per-post, so it starts working
-                // the moment the user grants — poll just to log/report it.
-                while !AXIsProcessTrusted() {
-                    try await Task.sleep(for: .seconds(2))
-                    if stopped { return }
-                }
-                Log.info("Accessibility permission granted — remote input live")
+        // Both mirror and extend accept input from a receiver. Keep the video
+        // running while the user grants Accessibility through the permission panel.
+        if !AXIsProcessTrusted() {
+            await status("\(mode == .extend ? "Extending" : "Mirroring") — grant Accessibility for remote input")
+            while !AXIsProcessTrusted() {
+                try await Task.sleep(for: .seconds(2))
+                if stopped { return }
             }
+            Log.info("Accessibility permission granted — remote input live")
         }
     }
 
@@ -857,7 +855,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
 
         try ensureActiveDisplay(vd)
-        inputInjector = InputInjector(displayID: vd.displayID)
         try await startCapture(display: captureDisplay,
                                sourcePixelsWide: vd.pixelsWide,
                                sourcePixelsHigh: vd.pixelsHigh,
@@ -1035,10 +1032,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                sourcePixelsHigh: pointsHigh * scale,
                                receiver: info)
         try ensureActiveDisplay(vd)
-        if dimensionsChanged {
-            inputInjector = InputInjector(displayID: vd.displayID)
-        }
-
         if dimensionsChanged, UserDefaults.standard.bool(forKey: "testPattern") {
             let id = vd.displayID
             Task { @MainActor in TestPattern.show(on: id) }
@@ -1068,7 +1061,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                    sourcePixelsHigh: canvas.pixelsHigh,
                                    receiver: info)
             try ensureActiveDisplay(vd)
-            inputInjector = InputInjector(displayID: vd.displayID)
             return true
         } catch {
             try ensureActiveDisplay(vd)
@@ -1326,6 +1318,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             throw error
         }
+        // Bind input to the display actually captured in either mode, also
+        // after display changes and capture recovery. Replacing it releases
+        // any input held against the previous capture target.
+        queue.sync {
+            inputInjector = InputInjector(displayID: display.displayID)
+            loggedRemoteInput = false
+        }
+        Log.info("remote input target: display \(display.displayID), mode \(mode.rawValue), accessibility=\(AXIsProcessTrusted())")
         captureDisplayID = display.displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         startCursorEcho()
@@ -2528,12 +2528,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "mouse":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double, let y = obj["y"] as? Double {
+                logRemoteInputIfNeeded()
                 inputInjector?.handleMouse(phase: phase, x: x, y: y,
                     button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
                     modifiers: obj["modifiers"] as? UInt64 ?? 0)
             }
         case "key":
             if let phase = obj["phase"] as? String, let code = obj["keyCode"] as? Int {
+                logRemoteInputIfNeeded()
                 inputInjector?.handleKey(phase: phase, keyCode: code,
                     modifiers: obj["modifiers"] as? UInt64 ?? 0,
                     repeatKey: obj["repeat"] as? Bool ?? false)
@@ -3159,6 +3161,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("asking the receiver to \(action.rawValue)")
             self.sendJSONFrame("{\"type\":\"\(WireMessage.power)\",\"action\":\"\(action.rawValue)\"}")
         }
+    }
+
+    /// One diagnostic per capture target, without recording keys or coordinates.
+    private func logRemoteInputIfNeeded() {
+        guard !loggedRemoteInput else { return }
+        loggedRemoteInput = true
+        Log.info("receiver input arrived: targetReady=\(inputInjector != nil), accessibility=\(AXIsProcessTrusted())")
     }
 
     // MARK: - Version handshake (issue #132)
