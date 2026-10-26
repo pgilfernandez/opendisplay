@@ -25,6 +25,7 @@ final class InputInjectorTests: XCTestCase {
         injector.releaseRemoteInput()
         XCTAssertEqual(events.map(\.type), [.flagsChanged, .keyDown, .keyDown, .keyUp, .flagsChanged])
         XCTAssertTrue(events[1].flags.contains(.maskCommand))
+        XCTAssertEqual(events[1].getIntegerValueField(.eventSourceUserData), LocalInputMonitor.injectedEventTag)
         XCTAssertEqual(events[2].getIntegerValueField(.keyboardEventAutorepeat), 1)
         XCTAssertTrue(events[4].flags.isEmpty)
     }

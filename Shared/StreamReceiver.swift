@@ -78,6 +78,8 @@ final class StreamReceiver: ObservableObject {
     @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
 
     @Published private(set) var macSupportsRemoteInput = false
+    private var remoteInputEpoch = 0
+    var onInputReleased: (() -> Void)?
 
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
@@ -862,6 +864,7 @@ final class StreamReceiver: ObservableObject {
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             DispatchQueue.main.async {
+                self.remoteInputEpoch = obj["inputEpoch"] as? Int ?? 0
                 self.macProtocolVersion = macPV
                 let caps = obj["inputCaps"] as? [String] ?? []
                 self.macSupportsRemoteInput = caps.contains("mouse") && caps.contains("keyboard")
@@ -869,6 +872,12 @@ final class StreamReceiver: ObservableObject {
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
+            }
+        case "inputReleased":
+            guard let epoch = obj["inputEpoch"] as? Int else { return }
+            DispatchQueue.main.async {
+                self.remoteInputEpoch = epoch
+                self.onInputReleased?()
             }
         case WireMessage.streamConfig:
             // H.264 remains implicit for old senders. New senders announce the
@@ -1081,6 +1090,8 @@ final class StreamReceiver: ObservableObject {
 
     func sendRemoteInput(_ message: [String: Any]) {
         guard connected, macSupportsRemoteInput else { return }
+        var message = message
+        message["inputEpoch"] = remoteInputEpoch
         sendControl(message)
     }
 
@@ -1598,6 +1609,7 @@ final class StreamReceiver: ObservableObject {
         DispatchQueue.main.async {
             self.connected = value
             self.macSupportsRemoteInput = false
+            self.remoteInputEpoch = 0
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
             }

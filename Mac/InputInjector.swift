@@ -64,6 +64,7 @@ final class InputInjector {
          postRemoteEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
         self.displayID = displayID
         self.postRemoteEvent = postRemoteEvent
+        source?.userData = LocalInputMonitor.injectedEventTag
     }
 
     static func ensureAccessibilityPermission() -> Bool {

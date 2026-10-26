@@ -156,8 +156,10 @@ the device row says *Cable*. Older Macs with a Mini DisplayPort-shaped
 Thunderbolt 1 or 2 port work with a Thunderbolt 3 to 2 adapter and a
 Thunderbolt 2 cable.
 The receiving Mac's keyboard, mouse and trackpad can control the sender.
-Click inside the video to capture input; **Control–Option–Escape** releases
-control locally. Clicking the video captures it again. Input is released when
+Click inside the video to capture input. Moving the sender's own mouse or
+using its keyboard immediately takes control back; click the video again to
+resume receiver input. **Control–Option–Escape** also releases capture on the
+receiver. Input is released when
 the window loses focus, closes or disconnects. Movement, left/right/middle
 clicks, dragging, scrolling, key repeats and modifier shortcuts are forwarded.
 System shortcuts such as Command–Tab remain local. Both Macs need a build with

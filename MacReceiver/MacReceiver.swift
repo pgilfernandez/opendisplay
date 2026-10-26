@@ -471,6 +471,10 @@ final class ReceiverVideoView: NSView {
     }
 
     private func installInputHandling() {
+        receiver?.onInputReleased = { [weak self] in
+            self?.releaseInput()
+            Log.info("sender took control — click the video to resume receiver input")
+        }
         // A local monitor sees menu shortcuts before AppKit consumes them.
         // System shortcuts (for example Cmd-Tab) remain available locally.
         inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in

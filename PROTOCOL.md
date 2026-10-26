@@ -317,6 +317,17 @@ connection. Existing `touch`, `scroll` and pencil behavior is unchanged.
   `repeat` is true for repeated key-downs. `flags` changes modifier state.
 * `modifiers` is the unsigned NSEvent/CGEvent device-independent flag mask
   (bits 16..23), shared by mouse, key and optionally scroll messages.
+* `welcome.inputEpoch` (optional integer, default 0) identifies the current
+  physical-input ownership generation. Receivers that understand it attach
+  `inputEpoch` to all physical input and reset messages.
+* Local activity on the sender takes priority. When it revokes receiver input,
+  the sender releases held remote keys/buttons, increments the epoch and sends
+  `{"type":"inputReleased","inputEpoch":1}` with the new value. The receiver
+  updates its epoch and releases capture until the user clicks the video again.
+  The sender ignores stale-epoch input, including clicks already in flight;
+  only a mouse down in the current epoch can reclaim input. Legacy messages
+  without an epoch still support click-to-reclaim, without stale-event protection.
+  Synthetic OpenDisplay events MUST NOT trigger local takeover.
 * On loss of input focus the receiver sends `inputReset`. The sender releases
   held remote input on reset, disconnect, transport replacement, display
   replacement and session stop, so a lost key-up cannot leave keys held.
@@ -428,10 +439,11 @@ section 4.
 | `ping` | pv 1 | `drops`?, `encDrops`?, `netDrops`?, `pending`?, `inp50`?, `inp95`?, `capFps`? | Liveness + sender health |
 | `cursor` | pv 1 | `x`?, `y`?, `v` | Cursor position/visibility |
 | `cursorImg` | pv 1 | `nw`, `nh`, `ax`, `ay`, `png` | Cursor sprite |
-| `welcome` | pv 2 | `pv`, `min` | Sender's side of the version handshake |
+| `welcome` | pv 2 | `pv`, `min`, `inputCaps`?, `inputEpoch`? | Sender's side of the version handshake |
 | `updateRequired` | pv 2 | `target`, `store`, `message` | Peer must update to continue |
 | `streamConfig` | pv 3 (additive) | `codec`, `width`, `height`, `framesPerSecond` | Selected video operating point |
 | `power` | pv 3 (additive) | `action` | Ask the receiver to power off (6.6) |
+| `inputReleased` | pv 3 (additive) | `inputEpoch` | Local sender input revoked receiver capture (6.1) |
 
 **`pong`** echoes the `t` from the receiver's `ping` unchanged and adds
 `mt`: milliseconds since the Unix epoch on the sender's clock at the moment

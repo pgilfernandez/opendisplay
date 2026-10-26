@@ -167,6 +167,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
+    private let localInputMonitor = LocalInputMonitor()
+    private var remoteInputOwnership = RemoteInputOwnership()
     private var loggedRemoteInput = false
     private var inputInjector: InputInjector? {
         willSet { inputInjector?.releaseRemoteInput() }
@@ -443,6 +445,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
 
+        startLocalInputMonitor()
+
         // Both mirror and extend accept input from a receiver. Keep the video
         // running while the user grants Accessibility through the permission panel.
         if !AXIsProcessTrusted() {
@@ -452,6 +456,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if stopped { return }
             }
             Log.info("Accessibility permission granted — remote input live")
+            startLocalInputMonitor()
         }
     }
 
@@ -1344,6 +1349,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stop() {
+        DispatchQueue.main.async { self.localInputMonitor.stop() }
         stopped = true
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
@@ -1659,6 +1665,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lastCursorSent = (-1, -1, false)
             self.cursorSessionGeneration = readyGeneration
         }
+        remoteInputOwnership.reset()
         everConnected = true
         awaitingWake = false
         consecutiveRefusals = 0
@@ -2443,6 +2450,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             )
             return
         }
+        // Block stale remote input immediately, before the receiver learns
+        // that a local action has taken control back.
+        if ["mouse", "key"].contains(type) || (type == "scroll" && obj["inputEpoch"] != nil) {
+            guard remoteInputOwnership.accept(type: type, phase: obj["phase"] as? String,
+                                               epoch: obj["inputEpoch"] as? Int) else { return }
+        }
         switch type {
         case "ping":
             // Echo with our clock so the phone can estimate the offset
@@ -2541,6 +2554,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     repeatKey: obj["repeat"] as? Bool ?? false)
             }
         case "inputReset":
+            if let epoch = obj["inputEpoch"] as? Int, epoch != remoteInputOwnership.epoch { return }
+            remoteInputOwnership.reset()
             inputInjector?.releaseRemoteInput()
         case "touch":
             if let phase = obj["phase"] as? String,
@@ -3163,6 +3178,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    private func startLocalInputMonitor() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.localInputMonitor.start { [weak self] in
+                self?.queue.async { [weak self] in
+                    guard let self, !self.stopped, self.remoteInputOwnership.localActivity() else { return }
+                    self.inputInjector?.releaseRemoteInput()
+                    self.sendJSONFrame("{\"type\":\"inputReleased\",\"inputEpoch\":\(self.remoteInputOwnership.epoch)}")
+                    Log.info("local sender input took control back from receiver")
+                }
+            }
+        }
+    }
+
     /// One diagnostic per capture target, without recording keys or coordinates.
     private func logRemoteInputIfNeeded() {
         guard !loggedRemoteInput else { return }
@@ -3175,7 +3204,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"inputCaps\":[\"mouse\",\"keyboard\"]}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"inputCaps\":[\"mouse\",\"keyboard\"],\"inputEpoch\":\(remoteInputOwnership.epoch)}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the
