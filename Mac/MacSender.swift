@@ -167,7 +167,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
-    private var inputInjector: InputInjector?
+    private var inputInjector: InputInjector? {
+        willSet { inputInjector?.releaseRemoteInput() }
+    }
 
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
@@ -443,14 +445,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // streaming works without it, so don't interrupt with a prompt —
             // the permission panel's Grant button asks when the user is ready.
             if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for touch input")
+                await status("Extending — grant Accessibility for remote input")
                 // Event posting is trust-checked per-post, so it starts working
                 // the moment the user grants — poll just to log/report it.
                 while !AXIsProcessTrusted() {
                     try await Task.sleep(for: .seconds(2))
                     if stopped { return }
                 }
-                Log.info("Accessibility permission granted — touch input live")
+                Log.info("Accessibility permission granted — remote input live")
             }
         }
     }
@@ -1349,6 +1351,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorImageTimer = nil
         stream?.stopCapture { _ in }
         stream = nil
+        inputInjector?.releaseRemoteInput()
         connection?.cancel()
         connection = nil
         // Cursor-channel state is confined to `queue` (the 120Hz poll and the
@@ -1395,6 +1398,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connectionReady = false
             self.currentPathDirectLink = false   // the new transport re-classifies
             self.dialGeneration += 1   // a dial still in flight must not adopt
+            self.inputInjector?.releaseRemoteInput()
             self.connection?.cancel()
             self.connection = nil
             self.closeCursorChannel()
@@ -2084,6 +2088,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         currentPathDirectLink = false
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
+        inputInjector?.releaseRemoteInput()
         connection?.cancel()
         connection = nil
         closeCursorChannel()   // rebuilt from the next hello
@@ -2520,6 +2525,21 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
+        case "mouse":
+            if let phase = obj["phase"] as? String,
+               let x = obj["x"] as? Double, let y = obj["y"] as? Double {
+                inputInjector?.handleMouse(phase: phase, x: x, y: y,
+                    button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
+                    modifiers: obj["modifiers"] as? UInt64 ?? 0)
+            }
+        case "key":
+            if let phase = obj["phase"] as? String, let code = obj["keyCode"] as? Int {
+                inputInjector?.handleKey(phase: phase, keyCode: code,
+                    modifiers: obj["modifiers"] as? UInt64 ?? 0,
+                    repeatKey: obj["repeat"] as? Bool ?? false)
+            }
+        case "inputReset":
+            inputInjector?.releaseRemoteInput()
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
@@ -2535,7 +2555,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "scroll":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                inputInjector?.handleScroll(dx: dx, dy: dy)
+                inputInjector?.handleScroll(dx: dx, dy: dy, modifiers: obj["modifiers"] as? UInt64 ?? 0)
             }
         case "pencil":
             if let phase = obj["phase"] as? String,
@@ -3146,7 +3166,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer)}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"inputCaps\":[\"mouse\",\"keyboard\"]}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

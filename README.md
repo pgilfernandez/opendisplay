@@ -155,8 +155,14 @@ the session onto the cable automatically, even one plugged in mid-session, and
 the device row says *Cable*. Older Macs with a Mini DisplayPort-shaped
 Thunderbolt 1 or 2 port work with a Thunderbolt 3 to 2 adapter and a
 Thunderbolt 2 cable.
-Input from the receiving Mac's keyboard and mouse is a follow-up
-([#147](https://github.com/peetzweg/opendisplay/issues/147)).
+The receiving Mac's keyboard, mouse and trackpad can control the sender.
+Click inside the video to capture input; **Control–Option–Escape** releases
+control locally. Clicking the video captures it again. Input is released when
+the window loses focus, closes or disconnects. Movement, left/right/middle
+clicks, dragging, scrolling, key repeats and modifier shortcuts are forwarded.
+System shortcuts such as Command–Tab remain local. Both Macs need a build with
+this feature, and the sender needs Accessibility permission. Physical key
+positions use the sender's keyboard layout.
 
 **Which settings give the best picture?** Out of the box OpenDisplay already
 picks the sharpest setup it can, so you rarely need to change anything. The

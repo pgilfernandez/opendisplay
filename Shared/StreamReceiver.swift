@@ -77,6 +77,8 @@ final class StreamReceiver: ObservableObject {
     /// Mac protocol version from the most recent `welcome` message.
     @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
 
+    @Published private(set) var macSupportsRemoteInput = false
+
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
 
@@ -861,6 +863,8 @@ final class StreamReceiver: ObservableObject {
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
+                let caps = obj["inputCaps"] as? [String] ?? []
+                self.macSupportsRemoteInput = caps.contains("mouse") && caps.contains("keyboard")
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
@@ -1073,6 +1077,11 @@ final class StreamReceiver: ObservableObject {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
+    }
+
+    func sendRemoteInput(_ message: [String: Any]) {
+        guard connected, macSupportsRemoteInput else { return }
+        sendControl(message)
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
@@ -1588,6 +1597,7 @@ final class StreamReceiver: ObservableObject {
     private func setConnected(_ value: Bool) {
         DispatchQueue.main.async {
             self.connected = value
+            self.macSupportsRemoteInput = false
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
             }
