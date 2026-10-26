@@ -74,6 +74,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
+    private var headlessMirror = false
+    private var usesVirtualDesktop: Bool { mode == .extend || headlessMirror }
+    private var mirrorScreenObserver: NSObjectProtocol?
+    private var mirrorScreenChangeTask: Task<Void, Never>?
     private let queue = DispatchQueue(label: "sender.video")
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
@@ -398,25 +402,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         switch mode {
         case .mirror:
-            // Mirror also waits for hello so receiver capabilities are applied
-            // before the first encoder is created. Legacy receivers omit the
-            // new fields and retain the existing H.264 behavior.
             let info = try await waitForHello()
-            let content = try await SCShareableContent.current
-            guard let display = content.displays.first else {
-                throw NSError(domain: "MacSender", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "no displays found"])
-            }
-            // SCDisplay.width/height are POINTS. Capturing at points on a
-            // Retina panel discards half the raster before the encoder ever
-            // sees it, and no quality setting can bring it back — read the
-            // true pixel size from the active display mode.
-            let displayMode = CGDisplayCopyDisplayMode(display.displayID)
-            let pixelsW = displayMode?.pixelWidth ?? display.width
-            let pixelsH = displayMode?.pixelHeight ?? display.height
-            try await startCapture(display: display,
-                                   sourcePixelsWide: pixelsW, sourcePixelsHigh: pixelsH,
-                                   receiver: info)
+            startMirrorScreenObserver()
+            try await setupMirror(info)
 
         case .extend:
             // awaitingWake is queue-confined — read it there before surfacing.
@@ -480,6 +468,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// one capped at the stream size so capture is 1:1 (`DesktopPolicy.canvas`).
     /// Debug builds: `-canvasAtStreamSize NO` keeps the uncapped desktop for A/B tests.
     private func desktopCanvas(for info: PhoneInfo) -> VirtualCanvasSize {
+        if headlessMirror,
+           let native = MirrorDisplayPolicy.nativeCanvas(pixelsWide: info.facts.pixelsWide,
+               pixelsHigh: info.facts.pixelsHigh, scale: info.facts.scale) {
+            if isRefused(native) {
+                return MirrorDisplayPolicy.nativeCanvas(pixelsWide: info.facts.pixelsWide,
+                    pixelsHigh: info.facts.pixelsHigh, scale: 1) ?? native
+            }
+            return native
+        }
         let plan = desktopPlan(for: info)
         #if DEBUG
         let defaults = UserDefaults.standard
@@ -655,6 +652,93 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let maxW = info.maxEncodeWide, let maxH = info.maxEncodeHigh,
               maxW > 0, maxH > 0 else { return nil }
         return PixelSize(width: maxW, height: maxH)
+    }
+
+    /// Exclude every OpenDisplay virtual monitor, including sibling sessions,
+    /// so a headless mirror never captures an unrelated extended desktop.
+    private func mirrorReference(in content: SCShareableContent) -> SCDisplay? {
+        let available = content.displays.filter { CGDisplayIsOnline($0.displayID) != 0 }
+        let virtuals = Set(available.filter {
+            CGDisplayVendorNumber($0.displayID) == 0x5043 || $0.displayID == virtualDisplay?.displayID
+        }.map(\.displayID))
+        guard let id = MirrorDisplayPolicy.referenceDisplay(available: available.map(\.displayID),
+            main: CGMainDisplayID(), openDisplayVirtuals: virtuals) else { return nil }
+        return available.first { $0.displayID == id }
+    }
+
+    private func hasMirrorReferenceOnline() -> Bool {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return false }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return false }
+        return displays.prefix(Int(count)).contains {
+            $0 != virtualDisplay?.displayID && CGDisplayVendorNumber($0) != 0x5043
+        }
+    }
+
+    /// Do not ask ScreenCaptureKit for a display list before creating the
+    /// first virtual monitor: that query can fail on a genuinely headless Mac.
+    private func currentMirrorReference() async throws -> SCDisplay? {
+        guard hasMirrorReferenceOnline() else { return nil }
+        return mirrorReference(in: try await SCShareableContent.current)
+    }
+
+    private func setupMirror(_ info: PhoneInfo) async throws {
+        let reference = try await currentMirrorReference()
+        guard !stopped else { throw CancellationError() }
+        if let display = reference {
+            Log.info("mirror reference: display \(display.displayID), vendor \(CGDisplayVendorNumber(display.displayID))")
+            headlessMirror = false
+            let displayMode = CGDisplayCopyDisplayMode(display.displayID)
+            try await startCapture(display: display,
+                sourcePixelsWide: displayMode?.pixelWidth ?? display.width,
+                sourcePixelsHigh: displayMode?.pixelHeight ?? display.height, receiver: info)
+            // Start the physical capture before releasing the previous virtual
+            // desktop, so a monitor plug-in does not leave a blank session.
+            virtualDisplay = nil
+        } else {
+            headlessMirror = true
+            Log.info("mirror has no reference display — using receiver-native virtual desktop")
+            if try await resizeExistingDisplay(for: info) { return }
+            virtualDisplay = nil
+            try await setupExtend(info)
+        }
+    }
+
+    /// A monitor can disappear while Mirror is running. Also switch back to
+    /// its desktop when one returns. Ignore our own display/mode notifications.
+    private func startMirrorScreenObserver() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.stopped, self.mirrorScreenObserver == nil else { return }
+            self.mirrorScreenObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.mirrorScreenChangeTask?.cancel()
+                self.mirrorScreenChangeTask = Task { [weak self] in
+                    do {
+                        try await Task.sleep(for: .milliseconds(700))
+                        guard let self, !self.stopped, !self.reconfiguring, self.stream != nil,
+                              let hello = self.lastHello else { return }
+                        let reference = try await self.currentMirrorReference()
+                        try Task.checkCancellation()
+                        if let reference {
+                            guard self.headlessMirror || reference.displayID != self.captureDisplayID else { return }
+                        } else {
+                            guard !self.headlessMirror else { return }
+                        }
+                        Log.info("mirror reference changed — reconfiguring capture")
+                        // Creating/releasing a virtual monitor emits another
+                        // screen notification; it must not cancel this rebuild.
+                        self.mirrorScreenChangeTask = nil
+                        await self.reconfigure(hello)
+                    } catch is CancellationError {
+                    } catch {
+                        Log.info("mirror display change check failed: \(error)")
+                    }
+                }
+            }
+        }
     }
 
     private func setupExtend(_ info: PhoneInfo) async throws {
@@ -895,17 +979,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             do {
                 switch mode {
                 case .mirror:
-                    let content = try await SCShareableContent.current
-                    guard let display = content.displays.first else {
-                        throw NSError(domain: "MacSender", code: 1,
-                                      userInfo: [NSLocalizedDescriptionKey: "no display found"])
-                    }
-                    let displayMode = CGDisplayCopyDisplayMode(display.displayID)
-                    try await startCapture(
-                        display: display,
-                        sourcePixelsWide: displayMode?.pixelWidth ?? display.width,
-                        sourcePixelsHigh: displayMode?.pixelHeight ?? display.height,
-                        receiver: target)
+                    try await setupMirror(target)
                 case .extend:
                     if try await resizeExistingDisplay(for: target) {
                         // The display identity survived, so WindowServer has no
@@ -959,8 +1033,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             || old.facts.pixels != new.facts.pixels
         // The derived desktop, not the raw fields: a hello that changes
         // nothing the policy reads keeps the display as it is.
-        let desktopChanged = mode == .extend
-            && desktopPlan(for: old) != desktopPlan(for: new)
+        let desktopChanged = usesVirtualDesktop
+            && (headlessMirror ? desktopCanvas(for: old) != desktopCanvas(for: new)
+                               : desktopPlan(for: old) != desktopPlan(for: new))
         return receiverConstraintsChanged || desktopChanged
     }
 
@@ -1108,7 +1183,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         var current: VirtualDisplay? = make()
         guard let id = current?.displayID, let clash = await DisplayUnits.clash(for: id) else { return current }
         let held = Self.live.allObjects
-            .filter { $0 !== self && !$0.stopped && $0.mode == .extend }
+            .filter { $0 !== self && !$0.stopped && $0.usesVirtualDesktop }
             .compactMap { sender -> (sender: MacSender, unit: UInt32, display: CGDirectDisplayID)? in
                 guard let displayID = sender.virtualDisplay?.displayID else { return nil }
                 let unit = CGDisplayUnitNumber(displayID)
@@ -1284,7 +1359,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // resize the canvas for H.264 (scheduleCanvasRebuild).
             Log.info("HEVC encoder failed (\(error.localizedDescription)); falling back to H.264")
             hevcEncoderFailed = true
-            if mode == .extend { scheduleCanvasRebuild() }
+            if usesVirtualDesktop { scheduleCanvasRebuild() }
             selected = try select(VideoStreamConfiguration.h264Codec)
             pixelsWide = selected.encodedSize.width
             pixelsHigh = selected.encodedSize.height
@@ -1338,10 +1413,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) generation \(generation) mode \(mode.rawValue) localCursor=\(localCursor)")
         let kind = lastHello?.kind ?? "device"
-        await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
+        await status("\(headlessMirror ? "Mirroring virtual display to" : mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
     }
 
     func stop() {
+        DispatchQueue.main.async {
+            self.mirrorScreenChangeTask?.cancel()
+            self.mirrorScreenChangeTask = nil
+            if let observer = self.mirrorScreenObserver {
+                NotificationCenter.default.removeObserver(observer)
+                self.mirrorScreenObserver = nil
+            }
+        }
         stopped = true
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
@@ -1492,14 +1575,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // identity from ever coming online again (#206). Hand it to the
         // controller to honor exactly like the in-app Disconnect.
         if let scError = error as? SCStreamError, scError.code == .userStopped,
-           consoleIsInteractive {
+           consoleIsInteractive, CGDisplayIsOnline(captureDisplayID) != 0,
+           !CGDisplayBounds(captureDisplayID).isEmpty {
             Task { @MainActor in self.onCaptureStoppedByUser?() }
             return
         }
         Task { await status("Capture stopped: \(error.localizedDescription)") }
         // E.g. display sleep can tear the virtual display down underneath the
         // stream — rebuild instead of sitting dead until an app restart.
-        guard !stopped, mode == .extend else { return }
+        guard !stopped else { return }
         invalidateCapturePipeline()
         self.stream = nil
         scheduleCaptureRecovery()
@@ -1591,7 +1675,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// locked (display sleep drops capture seconds before the lock engages),
     /// so attempts then are doomed and must not count against the budget.
     private var consoleCanCapture: Bool {
-        consoleIsInteractive && CGDisplayIsAsleep(CGMainDisplayID()) == 0
+        let displayID = virtualDisplay?.displayID ?? CGMainDisplayID()
+        return consoleIsInteractive && (displayID == kCGNullDirectDisplay
+            || (mode == .mirror && !hasMirrorReferenceOnline()
+                && (virtualDisplay == nil || CGDisplayIsOnline(displayID) == 0))
+            || CGDisplayIsAsleep(displayID) == 0)
     }
 
     /// On `queue`: after a recovery round, re-arm the loop while capture is
@@ -2752,7 +2840,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// display's picture for a sustained stretch (#391).
     private func capturingAnotherDisplay(_ sampleBuffer: CMSampleBuffer) -> Bool {
         let displayID = captureDisplayID
-        guard mode == .extend, displayID != 0,
+        guard usesVirtualDesktop, displayID != 0,
               wrongDisplayReattaches < maxWrongDisplayReattaches,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
@@ -2775,7 +2863,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// a fresh one to our display. A new SCShareableContent lookup resolves
     /// the display correctly; the running stream is what went wrong.
     private func reattachCaptureToOwnDisplay() {
-        guard !stopped, mode == .extend, let stream else { return }
+        guard !stopped, usesVirtualDesktop, let stream else { return }
         // The last frame is the other display's picture: never replay it.
         invalidateCapturePipeline(discardingLastFrame: true)
         self.stream = nil

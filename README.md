@@ -158,6 +158,16 @@ Thunderbolt 2 cable.
 Input from the receiving Mac's keyboard and mouse is a follow-up
 ([#147](https://github.com/peetzweg/opendisplay/issues/147)).
 
+**Can Mirror work without a monitor on the sender?** Yes: when Mirror has no
+reference display, the sender creates a virtual desktop at the receiver's
+native panel resolution (HiDPI where supported) and streams it. It also switches
+to that virtual desktop when the last physical monitor is unplugged, and back
+to a physical display when one returns. Video quality and codec/decode limits
+still bound the transmitted resolution. The sender needs a logged-in, unlocked
+macOS user session and the usual permissions; this does not show firmware,
+FileVault preboot or the login screen. Configure permissions before removing
+the physical monitor.
+
 **Which settings give the best picture?** Out of the box OpenDisplay already
 picks the sharpest setup it can, so you rarely need to change anything. The
 defaults are: sender on **Best**, receiver at its **Default** display
