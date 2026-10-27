@@ -229,6 +229,8 @@ final class SenderController: ObservableObject {
 
     var running: Bool { !sessions.isEmpty }
 
+    private var requestListener: NWListener?
+    private var incomingRequests: [UUID: NWConnection] = [:]
     private var browser: NWBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
     private var accessoryWatcher: AccessoryDeviceWatcher?
@@ -296,6 +298,7 @@ final class SenderController: ObservableObject {
 
     init() {
         startBrowsing()
+        startRequestListener()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             self?.usbmuxDevices = devices
             self?.wiredDevicesChanged()
@@ -325,6 +328,65 @@ final class SenderController: ObservableObject {
         }
         browser.start(queue: .main)
         self.browser = browser
+    }
+
+    /// A receiver requests a connection by its advertised installation ID.
+    /// Only locally discovered receivers are eligible; no arbitrary endpoints.
+    private func startRequestListener() {
+        do {
+            let listener = try NWListener(using: .tcp)
+            listener.service = NWListener.Service(
+                name: Host.current().localizedName ?? "Mac", type: "_od-sender._tcp")
+            listener.newConnectionHandler = { [weak self] connection in
+                DispatchQueue.main.async {
+                    guard let self, self.incomingRequests.count < 16 else {
+                        connection.cancel()
+                        return
+                    }
+                    let key = UUID()
+                    self.incomingRequests[key] = connection
+                    connection.start(queue: .main)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                        self?.incomingRequests.removeValue(forKey: key)?.cancel()
+                    }
+                    connection.receive(minimumIncompleteLength: 36, maximumLength: 36) {
+                        [weak self] data, _, _, error in
+                        DispatchQueue.main.async {
+                            guard let self else {
+                                connection.cancel()
+                                return
+                            }
+                            let id = data.flatMap { String(data: $0, encoding: .utf8) }
+                            let result =
+                                error == nil && id.flatMap(UUID.init(uuidString:)) != nil
+                                ? self.discovered.first { self.txtID(of: $0) == id } : nil
+                            if let result { self.connect(to: .wifi(result), userInitiated: true) }
+                            connection.send(
+                                content: Data((result == nil ? "NO" : "OK").utf8),
+                                completion: .contentProcessed { [weak self] _ in
+                                    DispatchQueue.main.async {
+                                        self?.incomingRequests.removeValue(forKey: key)?.cancel()
+                                    }
+                                })
+                        }
+                    }
+                }
+            }
+            listener.stateUpdateHandler = { [weak self] state in
+                DispatchQueue.main.async {
+                    if case .failed(let error) = state {
+                        Log.info("sender discovery listener failed: \(error)")
+                        self?.requestListener?.cancel()
+                        self?.requestListener = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                            self?.startRequestListener()
+                        }
+                    }
+                }
+            }
+            requestListener = listener
+            listener.start(queue: .main)
+        } catch { Log.info("cannot advertise sender: \(error)") }
     }
 
     // MARK: - Physical-device identity

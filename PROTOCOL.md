@@ -931,3 +931,20 @@ This file is versioned by git; the authoritative change log is
 | 2026-08-26 | Additive: `hello.cursorPort` and the UDP cursor side channel (section 6.3) |
 | 2026-09-30 | Additive: `hello.power` and `power`, direct cable only (section 6.6) |
 | 2026-10-01 | Additive: `hello.panel`, the sender decides the desktop (section 6.7); limits are in the current orientation (6.5); `pixelsWide/High/scale` deprecated |
+
+### Receiver-initiated Mac connection requests
+
+Mac senders additionally advertise `_od-sender._tcp` via Bonjour, using the
+computer name and a dynamically assigned TCP port. Mac receivers browse this
+service and offer a Connect button. Existing `_opensidecar._tcp` discovery and
+all video framing remain unchanged; older peers still connect from the sender.
+
+The request is exactly 36 UTF-8 bytes: the receiver installation UUID already
+published as `id` in its `_opensidecar._tcp` TXT record. The sender accepts only a
+valid UUID matching a currently discovered receiver, invokes its normal connect
+flow, and replies with two ASCII bytes: `OK` (request accepted) or `NO` (unknown
+receiver or invalid request). `OK` does not guarantee that capture or video has
+started; normal permissions and stream negotiation still apply. The sender
+closes each request socket within five seconds and limits outstanding requests
+to sixteen. The receiver times out after seven seconds and permits retrying.
+Like the existing LAN connection flow, this discovery channel is unauthenticated.
