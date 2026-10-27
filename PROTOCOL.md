@@ -288,8 +288,8 @@ Coordinates use the conventions of section 7.
 
 | `type` | Since | Fields | Purpose |
 |---|---|---|---|
-| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `displayMaxFrameRate`?, `videoCaps`?, `panel`? | Identify the panel and receiver video capabilities; (re)sent on connect and on rotation |
-| `ping` | pv 1 | `t` | Liveness + clock sync probe |
+| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `displayMaxFrameRate`?, `videoCaps`?, `panel`?, `transport`? | Identify the panel and receiver video capabilities; (re)sent on connect and on rotation |
+| `ping` | pv 1 | `t`, `transport`? | Liveness + clock sync probe |
 | `touch` | pv 1 | `phase`, `x`, `y`, `t`? | Finger input |
 | `scroll` | pv 1 | `dx`, `dy` | Two-finger scroll |
 | `pencil` | pv 3 | `phase`, `x`, `y`, `pressure`, `azimuth`, `altitude`, `rotation`, `t`? | Stylus input |
@@ -380,7 +380,14 @@ is up is a hover move.
 to `touch` events instead. (An old sender would ignore the unknown types
 and the stylus would go dead; the fallback keeps it usable.)
 
-**`stats`** is free-form telemetry the sender only logs, so both ends stay
+Receivers may include `transport` (`WiFi`, `Cable`, or `USB`) in `hello`
+and `ping`, updating it when the connection path changes. Senders use this
+optional receiver-side information together with their local path for the
+connection label: either endpoint using Wi-Fi means the route uses Wi-Fi.
+Older receivers can supply the same information in `stats`. This describes
+the endpoint interfaces, not every intermediate network hop.
+
+**`stats`** is free-form telemetry, so both ends stay
 diagnosable from one log file. The official receiver sends it every ~5 s
 with fields like `transport`, `fps`, `mbps`, `e2e50`, `e2e95`, `enc50`,
 `rtt`, `stalls`, `dec50`, `ph50`, `ph95`, `offsetKnown`. No field is

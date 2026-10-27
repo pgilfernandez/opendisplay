@@ -736,6 +736,13 @@ final class StreamReceiver: ObservableObject {
             self.setConnected(true)
             self.sendHello(on: conn)
         }
+        conn.pathUpdateHandler = { [weak self, weak conn] path in
+            guard let self, let conn, conn === self.connection, self.transport != "USB" else { return }
+            let transport = path.usesInterfaceType(.wifi) ? "WiFi" : "Cable"
+            guard transport != self.transport else { return }
+            self.transport = transport
+            self.sendControl(["type": "ping", "t": self.nowMs, "transport": transport])
+        }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, conn === self.connection else { return }   // replaced: stay quiet
             switch state {
@@ -771,7 +778,7 @@ final class StreamReceiver: ObservableObject {
         ping.schedule(deadline: .now() + 2.0, repeating: 2.0)
         ping.setEventHandler { [weak self] in
             guard let self, self.connection?.state == .ready else { return }
-            self.sendControl(["type": "ping", "t": self.nowMs])
+            self.sendControl(["type": "ping", "t": self.nowMs, "transport": self.transport])
         }
         ping.resume()
         pingTimer = ping
@@ -955,6 +962,7 @@ final class StreamReceiver: ObservableObject {
     private func sendHello(on conn: NWConnection, includeCursorPort: Bool = true) {
         var hello: [String: Any] = [
             "type": "hello",
+            "transport": transport,
             "pixelsWide": devicePixelsWide,
             "pixelsHigh": devicePixelsHigh,
             "scale": deviceScale,

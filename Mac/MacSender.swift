@@ -50,8 +50,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Fired when the receiver announces the app is quitting: deliberate,
     // so the controller ends the session without arming a reconnect.
     @MainActor var onPeerClosed: (() -> Void)?
-    // Fired once a TCP connection is live, with whether it runs over a
-    // wired path (Thunderbolt Bridge / Ethernet) rather than WiFi — the UI
+    // Fired when either endpoint reports a path change, with whether it runs
+    // over a wired path (Thunderbolt Bridge / Ethernet) rather than WiFi — the UI
     // labels the row so the user can see the cable is actually in use.
     @MainActor var onTransportPath: ((_ wired: Bool) -> Void)?
     // Fired on every hello — carries the receiver's install id so the
@@ -244,6 +244,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // is already as good as a probe could find — re-probing there would
     // migrate in a circle.
     private var currentPathUsesWiFi = false
+    private var receiverUsesWiFi: Bool?
     // Set while the live session rides the direct cable link (USB-C /
     // Thunderbolt host-to-host to a Mac receiver, link-local addressed).
     // Losing that link is treated as intent — see linkDied(). A merely-
@@ -1451,7 +1452,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let wired = !path.usesInterfaceType(.wifi) && !path.usesInterfaceType(.loopback)
             && !path.usesInterfaceType(.cellular)
-        currentPathDirectLink = wired
+        currentPathDirectLink = wired && receiverUsesWiFi != true
             && DirectCable.isLinkLocal(path.remoteEndpoint ?? conn.endpoint)
     }
 
@@ -1693,15 +1694,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.linkDied("path no longer viable")
         }
         receiveControl(on: conn)
-        refreshDirectLinkClassification(for: conn)
-        if let path = conn.currentPath {
-            let wired = !path.usesInterfaceType(.wifi) && !path.usesInterfaceType(.loopback)
-                && !path.usesInterfaceType(.cellular)
-            currentPathUsesWiFi = path.usesInterfaceType(.wifi)
-            let names = path.availableInterfaces.map(\.name).joined(separator: ",")
-            Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)")
-            Task { @MainActor in self.onTransportPath?(wired) }
+        receiverUsesWiFi = nil
+        conn.pathUpdateHandler = { [weak self, weak conn] _ in
+            guard let self, let conn, self.connection === conn else { return }
+            self.refreshTransportPath(for: conn)
         }
+        refreshTransportPath(for: conn)
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
         // WiFi, so this is the only way to exercise probe+migrate on one Mac.
         if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
@@ -1710,6 +1708,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             stopUpgradeProbing()   // already off WiFi — nothing better to find
         }
         Task { await self.status("Connected to \(self.endpointName)") }
+    }
+
+    /// The local interface alone cannot identify a wired end-to-end route:
+    /// an Ethernet sender can reach a receiver over its Wi-Fi interface.
+    private func refreshTransportPath(for conn: NWConnection) {
+        guard connection === conn, let path = conn.currentPath else { return }
+        currentPathUsesWiFi = path.usesInterfaceType(.wifi)
+        refreshDirectLinkClassification(for: conn)
+        let wired = !currentPathUsesWiFi && !path.usesInterfaceType(.loopback)
+            && !path.usesInterfaceType(.cellular) && receiverUsesWiFi != true
+        let names = path.availableInterfaces.map(\.name).joined(separator: ",")
+        Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink) receiverWiFi=\(String(describing: receiverUsesWiFi))")
+        Task { @MainActor in self.onTransportPath?(wired) }
+    }
+
+    private func recordReceiverTransport(_ value: Any?) {
+        guard let name = value as? String, ["WiFi", "Cable", "USB"].contains(name) else { return }
+        let wifi = name == "WiFi"
+        guard receiverUsesWiFi != wifi else { return }
+        receiverUsesWiFi = wifi
+        if let conn = connection { refreshTransportPath(for: conn) }
     }
 
     // MARK: - Cable upgrade (PROTOCOL.md 6.4)
@@ -2440,6 +2459,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         switch type {
         case "ping":
+            recordReceiverTransport(obj["transport"])
             // Echo with our clock so the phone can estimate the offset
             // (NTP-style) and compute true end-to-end frame latency.
             if let t = obj["t"] as? Double {
@@ -2447,6 +2467,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 sendJSONFrame("{\"type\":\"pong\",\"t\":\(t),\"mt\":\(mt)}")
             }
         case "stats":
+            recordReceiverTransport(obj["transport"])
             // Aggregated pipeline health measured on the phone — logged here
             // so one file holds both ends of the story.
             if let json = try? JSONSerialization.data(withJSONObject: obj),
@@ -2466,6 +2487,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 Log.info("cursor channel confirmed by the receiver")
             }
         case "hello":
+            recordReceiverTransport(obj["transport"])
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
                 let previous = lastHello
                 lastHello = info
