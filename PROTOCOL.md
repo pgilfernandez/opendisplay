@@ -291,13 +291,48 @@ Coordinates use the conventions of section 7.
 | `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `displayMaxFrameRate`?, `videoCaps`?, `panel`? | Identify the panel and receiver video capabilities; (re)sent on connect and on rotation |
 | `ping` | pv 1 | `t` | Liveness + clock sync probe |
 | `touch` | pv 1 | `phase`, `x`, `y`, `t`? | Finger input |
-| `scroll` | pv 1 | `dx`, `dy` | Two-finger scroll |
+| `scroll` | pv 1 | `dx`, `dy`, `modifiers`? | Touch or physical-pointer scroll |
+| `mouse` | pv 3 (additive) | `phase`, `x`, `y`, `button`, `clicks`, `modifiers` | Physical pointer input |
+| `key` | pv 3 (additive) | `phase`, `keyCode`, `modifiers`, `repeat` | Physical keyboard input |
+| `inputReset` | pv 3 (additive) | none | Release held physical keys, modifiers and buttons |
 | `pencil` | pv 3 | `phase`, `x`, `y`, `pressure`, `azimuth`, `altitude`, `rotation`, `t`? | Stylus input |
 | `proximity` | pv 3 | `entering`, `x`, `y` | Stylus hover enter/leave |
 | `kf` | pv 1 | none | Request an IDR (section 5.3) |
 | `stats` | pv 1 | free-form | Receiver-side telemetry for the sender's log |
 | `sleeping` | pv 2 | none | Device locked; session ends, reconnect on wake expected |
 | `closing` | pv 2 | none | App quit; session ends for good |
+
+Physical input is optional and additive. A capable sender includes
+`"inputCaps": ["mouse", "keyboard"]` in `welcome`. A receiver MUST NOT send
+`mouse`, `key` or `inputReset` unless the current session's `welcome` lists
+both capabilities; absent means unsupported. Reset capability state on every
+connection. Existing `touch`, `scroll` and pencil behavior is unchanged.
+
+* `mouse.phase` is `down`, `move` or `up`. `x/y` are normalized video
+  coordinates, top-left origin. `button` is a macOS button number (0 left,
+  1 right, 2 middle, through 31); `clicks` is the click count. A move with a
+  held button is a drag. Clamp out-of-picture drag/up coordinates to 0..1.
+* `key.phase` is `down`, `up` or `flags`. `keyCode` is a physical macOS
+  virtual key code (0..127), interpreted using the sender's keyboard layout.
+  `repeat` is true for repeated key-downs. `flags` changes modifier state.
+* `modifiers` is the unsigned NSEvent/CGEvent device-independent flag mask
+  (bits 16..23), shared by mouse, key and optionally scroll messages.
+* `welcome.inputEpoch` (optional integer, default 0) identifies the current
+  physical-input ownership generation. Receivers that understand it attach
+  `inputEpoch` to all physical input and reset messages.
+* Local activity on the sender takes priority. When it revokes receiver input,
+  the sender releases held remote keys/buttons, increments the epoch and sends
+  `{"type":"inputReleased","inputEpoch":1}` with the new value. The receiver
+  updates its epoch and releases capture until the user clicks the video again.
+  The sender ignores stale-epoch input, including clicks already in flight;
+  only a mouse down in the current epoch can reclaim input. Legacy messages
+  without an epoch still support click-to-reclaim, without stale-event protection.
+  Synthetic OpenDisplay events MUST NOT trigger local takeover.
+* On loss of input focus the receiver sends `inputReset`. The sender releases
+  held remote input on reset, disconnect, transport replacement, display
+  replacement and session stop, so a lost key-up cannot leave keys held.
+* The official Mac receiver captures input after a click inside the video.
+  Control–Option–Escape releases it locally; OS-reserved shortcuts stay local.
 
 **`hello`** MUST be the first message a receiver sends on every new
 connection, because the sender sizes its virtual display from it and can do
@@ -404,10 +439,11 @@ section 4.
 | `ping` | pv 1 | `drops`?, `encDrops`?, `netDrops`?, `pending`?, `inp50`?, `inp95`?, `capFps`? | Liveness + sender health |
 | `cursor` | pv 1 | `x`?, `y`?, `v` | Cursor position/visibility |
 | `cursorImg` | pv 1 | `nw`, `nh`, `ax`, `ay`, `png` | Cursor sprite |
-| `welcome` | pv 2 | `pv`, `min` | Sender's side of the version handshake |
+| `welcome` | pv 2 | `pv`, `min`, `inputCaps`?, `inputEpoch`? | Sender's side of the version handshake |
 | `updateRequired` | pv 2 | `target`, `store`, `message` | Peer must update to continue |
 | `streamConfig` | pv 3 (additive) | `codec`, `width`, `height`, `framesPerSecond` | Selected video operating point |
 | `power` | pv 3 (additive) | `action` | Ask the receiver to power off (6.6) |
+| `inputReleased` | pv 3 (additive) | `inputEpoch` | Local sender input revoked receiver capture (6.1) |
 
 **`pong`** echoes the `t` from the receiver's `ping` unchanged and adds
 `mt`: milliseconds since the Unix epoch on the sender's clock at the moment
@@ -709,7 +745,7 @@ sender).
 | `hello.panel.pixelsWide/High` | physical panel | pixels | current orientation |
 | `hello.panel.pointsWide/High` | receiver's own desktop | points | current orientation |
 | `hello.panel.scale` | none | real backing scale, may be fractional | n/a |
-| `touch.x/y`, `pencil.x/y`, `proximity.x/y` | video | normalized 0..1 | top-left, x right, y down |
+| `touch.x/y`, `mouse.x/y`, `pencil.x/y`, `proximity.x/y` | video | normalized 0..1 | top-left, x right, y down |
 | `scroll.dx/dy` | video | **pixels** (not normalized) | natural-scrolling sign |
 | `cursor.x/y` | video | normalized 0..1 | top-left |
 | `cursorImg.nw/nh` | display | normalized to display width/height | n/a |

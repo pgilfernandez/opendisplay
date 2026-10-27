@@ -152,6 +152,9 @@ targets:
     sources:
       - MacTests
       - Mac/MirrorDisplayPolicy.swift
+      - Mac/InputInjector.swift
+      - Mac/LocalInputMonitor.swift
+      - Mac/RemoteInputOwnership.swift
       - Mac/DisplayArrangement.swift
       - Mac/OriginRestore.swift
       - Mac/StreamConfiguration.swift

@@ -77,6 +77,10 @@ final class StreamReceiver: ObservableObject {
     /// Mac protocol version from the most recent `welcome` message.
     @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
 
+    @Published private(set) var macSupportsRemoteInput = false
+    private var remoteInputEpoch = 0
+    var onInputReleased: (() -> Void)?
+
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
 
@@ -860,11 +864,20 @@ final class StreamReceiver: ObservableObject {
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             DispatchQueue.main.async {
+                self.remoteInputEpoch = obj["inputEpoch"] as? Int ?? 0
                 self.macProtocolVersion = macPV
+                let caps = obj["inputCaps"] as? [String] ?? []
+                self.macSupportsRemoteInput = caps.contains("mouse") && caps.contains("keyboard")
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
+            }
+        case "inputReleased":
+            guard let epoch = obj["inputEpoch"] as? Int else { return }
+            DispatchQueue.main.async {
+                self.remoteInputEpoch = epoch
+                self.onInputReleased?()
             }
         case WireMessage.streamConfig:
             // H.264 remains implicit for old senders. New senders announce the
@@ -1073,6 +1086,13 @@ final class StreamReceiver: ObservableObject {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
+    }
+
+    func sendRemoteInput(_ message: [String: Any]) {
+        guard connected, macSupportsRemoteInput else { return }
+        var message = message
+        message["inputEpoch"] = remoteInputEpoch
+        sendControl(message)
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
@@ -1588,6 +1608,8 @@ final class StreamReceiver: ObservableObject {
     private func setConnected(_ value: Bool) {
         DispatchQueue.main.async {
             self.connected = value
+            self.macSupportsRemoteInput = false
+            self.remoteInputEpoch = 0
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
             }

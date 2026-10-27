@@ -6,8 +6,7 @@
 // keeping the machine awake while it serves as a screen. It ships as its own
 // app (OpenSidecarMacReceiver target, macOS 12+) so old Macs can be displays.
 //
-// Display-only for now: the receiving Mac's keyboard/trackpad are not
-// forwarded to the sender (KVM-style input is a follow-up).
+// Keyboard and pointer input over the video window is forwarded to capable senders.
 
 import AppKit
 import AVFoundation
@@ -281,6 +280,7 @@ final class ReceiverController: ObservableObject {
                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                              backing: .buffered, defer: false)
             w.title = "OpenDisplay"
+            w.acceptsMouseMovedEvents = true
             w.contentView = ReceiverVideoView(receiver: receiver)
             w.isReleasedWhenClosed = false
             w.collectionBehavior.insert(.fullScreenPrimary)
@@ -452,12 +452,139 @@ final class ReceiverVideoView: NSView {
         overlay.frame = bounds
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
+        installInputHandling()
+    }
+
+    private var inputMonitor: Any?
+    private var focusObservers: [NSObjectProtocol] = []
+    private var connectionObserver: AnyCancellable?
+    private var inputTrackingArea: NSTrackingArea?
+    private var heldButtons: Set<Int> = []
+    private var inputEnabled = false
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private var canForwardInput: Bool {
+        inputEnabled && window?.isKeyWindow == true && window?.firstResponder === self &&
+            receiver?.connected == true && receiver?.macSupportsRemoteInput == true
+    }
+
+    private func installInputHandling() {
+        receiver?.onInputReleased = { [weak self] in
+            self?.releaseInput()
+            Log.info("sender took control — click the video to resume receiver input")
+        }
+        // A local monitor sees menu shortcuts before AppKit consumes them.
+        // System shortcuts (for example Cmd-Tab) remain available locally.
+        inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+            guard let self, self.canForwardInput else { return event }
+            if event.type == .keyDown, event.keyCode == 53,
+               event.modifierFlags.contains([.control, .option]) {
+                self.releaseInput()
+                self.window?.makeFirstResponder(nil)
+                return nil
+            }
+            self.receiver?.sendRemoteInput([
+                "type": "key", "phase": event.type == .flagsChanged ? "flags" : event.type == .keyDown ? "down" : "up",
+                "keyCode": Int(event.keyCode), "modifiers": event.modifierFlags.rawValue,
+                "repeat": event.type == .keyDown && event.isARepeat,
+            ])
+            return nil
+        }
+        let center = NotificationCenter.default
+        for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification] {
+            focusObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let self, let window = note.object as? NSWindow, window === self.window else { return }
+                self.releaseInput()
+            })
+        }
+        connectionObserver = receiver?.$macSupportsRemoteInput.removeDuplicates().sink { [weak self] _ in
+            self?.releaseInput()
+        }
+    }
+
+    private func releaseInput() {
+        receiver?.sendRemoteInput(["type": "inputReset"])
+        heldButtons.removeAll()
+        inputEnabled = false
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        releaseInput()
+        return super.resignFirstResponder()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let inputTrackingArea { removeTrackingArea(inputTrackingArea) }
+        let area = NSTrackingArea(rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        inputTrackingArea = area
+    }
+
+    private func forwardMouse(_ event: NSEvent, phase: String) {
+        guard receiver?.macSupportsRemoteInput == true,
+              let rect = videoRect() else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        if phase == "down" {
+            guard rect.contains(point) else { return }
+            window?.makeFirstResponder(self)
+            inputEnabled = true
+            window?.invalidateCursorRects(for: self)
+        }
+        guard canForwardInput else { return }
+        let button = (event.type == .mouseMoved || event.type == .scrollWheel) ? (heldButtons.sorted().first ?? 0) : event.buttonNumber
+        if phase == "down" { heldButtons.insert(button) }
+        if phase == "up" {
+            guard heldButtons.remove(button) != nil else { return }
+        }
+        // Drag releases outside the picture are clamped so buttons cannot stick.
+        guard rect.contains(point) || !heldButtons.isEmpty || phase == "up" else { return }
+        receiver?.sendRemoteInput([
+            "type": "mouse", "phase": phase, "button": button,
+            "x": min(max((point.x - rect.minX) / rect.width, 0), 1),
+            "y": min(max((rect.maxY - point.y) / rect.height, 0), 1),
+            "clicks": phase == "move" ? 1 : max(event.clickCount, 1), "modifiers": event.modifierFlags.rawValue,
+        ])
+    }
+
+    override func mouseMoved(with event: NSEvent) { forwardMouse(event, phase: "move") }
+    override func mouseDown(with event: NSEvent) { forwardMouse(event, phase: "down") }
+    override func mouseUp(with event: NSEvent) { forwardMouse(event, phase: "up") }
+    override func mouseDragged(with event: NSEvent) { forwardMouse(event, phase: "move") }
+    override func rightMouseDown(with event: NSEvent) { forwardMouse(event, phase: "down") }
+    override func rightMouseUp(with event: NSEvent) { forwardMouse(event, phase: "up") }
+    override func rightMouseDragged(with event: NSEvent) { forwardMouse(event, phase: "move") }
+    override func otherMouseDown(with event: NSEvent) { forwardMouse(event, phase: "down") }
+    override func otherMouseUp(with event: NSEvent) { forwardMouse(event, phase: "up") }
+    override func otherMouseDragged(with event: NSEvent) { forwardMouse(event, phase: "move") }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard canForwardInput, let rect = videoRect(),
+              rect.contains(convert(event.locationInWindow, from: nil)),
+              let video = receiver?.videoSize else { return }
+        forwardMouse(event, phase: "move")
+        // AppKit precise deltas are view points; legacy scroll uses video pixels.
+        let unit: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
+        receiver?.sendRemoteInput([
+            "type": "scroll", "dx": event.scrollingDeltaX * unit * video.width / rect.width,
+            "dy": event.scrollingDeltaY * unit * video.height / rect.height,
+            "modifiers": event.modifierFlags.rawValue,
+        ])
+    }
+
+    deinit {
+        if let inputMonitor { NSEvent.removeMonitor(inputMonitor) }
+        focusObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: blankCursor)
+        addCursorRect(bounds, cursor: canForwardInput ? blankCursor : .arrow)
     }
 
     override func layout() {
@@ -548,8 +675,7 @@ struct ReceiverPerfOverlay: View {
     }
 }
 
-/// Full-bleed, non-interactive layer above the video. Subclassed only so the
-/// blank-cursor rect covers the HUD area too.
+/// Full-bleed HUD that lets pointer events reach the video view.
 private final class OverlayHostingView: NSHostingView<ReceiverPerfOverlay> {
     required init(rootView: ReceiverPerfOverlay) {
         super.init(rootView: rootView)
@@ -559,9 +685,8 @@ private final class OverlayHostingView: NSHostingView<ReceiverPerfOverlay> {
         fatalError("not used")
     }
 
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: blankCursor)
-    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
 }
 
 private struct PanelSize {

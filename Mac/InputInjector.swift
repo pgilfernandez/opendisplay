@@ -58,8 +58,13 @@ final class InputInjector {
     private var penClickSession: PenClickSession?
     private var penLastClick: PenCompletedClick?
 
-    init(displayID: CGDirectDisplayID) {
+    private let postRemoteEvent: (CGEvent) -> Void
+
+    init(displayID: CGDirectDisplayID,
+         postRemoteEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
         self.displayID = displayID
+        self.postRemoteEvent = postRemoteEvent
+        source?.userData = LocalInputMonitor.injectedEventTag
     }
 
     static func ensureAccessibilityPermission() -> Bool {
@@ -113,9 +118,99 @@ final class InputInjector {
         event.post(tap: .cghidEventTap)
     }
 
+    private let remoteInputLock = NSRecursiveLock()
+    private var remoteButtons: Set<Int> = []
+    private var remoteKeys: Set<CGKeyCode> = []
+    private var remoteFlags: CGEventFlags = []
+
+    /// Physical macOS key codes; flags use the portable NSEvent/CGEvent bits.
+    func handleKey(phase: String, keyCode: Int, modifiers: UInt64, repeatKey: Bool) {
+        remoteInputLock.lock()
+        defer { remoteInputLock.unlock() }
+        guard (0...127).contains(keyCode), ["down", "up", "flags"].contains(phase) else { return }
+        let code = CGKeyCode(keyCode)
+        let flags = inputFlags(modifiers)
+        if phase == "up", !remoteKeys.contains(code) { return }
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code,
+                                  keyDown: phase == "down") else { return }
+        if phase == "flags" {
+            event.type = .flagsChanged
+        } else if phase == "down" {
+            remoteKeys.insert(code)
+        } else {
+            remoteKeys.remove(code)
+        }
+        remoteFlags = flags
+        event.flags = flags
+        event.setIntegerValueField(.keyboardEventAutorepeat, value: repeatKey ? 1 : 0)
+        postRemoteEvent(event)
+    }
+
+    func handleMouse(phase: String, x: Double, y: Double, button: Int,
+                     clicks: Int, modifiers: UInt64) {
+        remoteInputLock.lock()
+        defer { remoteInputLock.unlock() }
+        guard x.isFinite, y.isFinite, (0...31).contains(button),
+              let cgButton = CGMouseButton(rawValue: UInt32(button)) else { return }
+        let point = screenPoint(nx: min(max(x, 0), 1), ny: min(max(y, 0), 1))
+        let type: CGEventType
+        switch phase {
+        case "down":
+            remoteButtons.insert(button)
+            type = button == 0 ? .leftMouseDown : button == 1 ? .rightMouseDown : .otherMouseDown
+        case "up":
+            guard remoteButtons.remove(button) != nil else { return }
+            type = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
+        case "move":
+            type = remoteButtons.contains(button)
+                ? (button == 0 ? .leftMouseDragged : button == 1 ? .rightMouseDragged : .otherMouseDragged)
+                : .mouseMoved
+        default: return
+        }
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type,
+                                  mouseCursorPosition: point, mouseButton: cgButton) else { return }
+        remoteFlags = inputFlags(modifiers)
+        event.flags = remoteFlags
+        event.setIntegerValueField(.mouseEventClickState, value: Int64(min(max(clicks, 1), 10)))
+        postRemoteEvent(event)
+    }
+
+    /// Release only input owned by this receiver, including held modifiers.
+    func releaseRemoteInput() {
+        remoteInputLock.lock()
+        defer { remoteInputLock.unlock() }
+        for button in remoteButtons.sorted() {
+            let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
+            let event = CGEvent(mouseEventSource: source, mouseType: type,
+                                mouseCursorPosition: currentCursor(),
+                                mouseButton: CGMouseButton(rawValue: UInt32(button))!)
+            event?.flags = []
+            if let event { postRemoteEvent(event) }
+        }
+        remoteButtons.removeAll()
+        for code in remoteKeys {
+            let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
+            event?.flags = []
+            if let event { postRemoteEvent(event) }
+        }
+        remoteKeys.removeAll()
+        if !remoteFlags.isEmpty {
+            let event = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: false)
+            event?.type = .flagsChanged
+            event?.flags = []
+            if let event { postRemoteEvent(event) }
+        }
+        remoteFlags = []
+    }
+
+    private func inputFlags(_ raw: UInt64) -> CGEventFlags {
+        CGEventFlags(rawValue: raw & 0x00FF0000)
+    }
+
     /// dx/dy in display pixels, natural-scrolling sign from the phone.
     /// Scroll events take points, so convert via the display's pixel scale.
-    func handleScroll(dx: Double, dy: Double) {
+    func handleScroll(dx: Double, dy: Double, modifiers: UInt64 = 0) {
+        guard dx.isFinite, dy.isFinite, abs(dx) < 1_000_000, abs(dy) < 1_000_000 else { return }
         let bounds = CGDisplayBounds(displayID)
         let scale = bounds.width > 0 ? Double(CGDisplayPixelsWide(displayID)) / bounds.width : 2
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
@@ -123,6 +218,7 @@ final class InputInjector {
                                   wheel1: Int32((dy / scale).rounded()),
                                   wheel2: Int32((dx / scale).rounded()),
                                   wheel3: 0) else { return }
+        event.flags = inputFlags(modifiers)
         event.post(tap: .cghidEventTap)
     }
 

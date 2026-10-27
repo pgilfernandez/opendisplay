@@ -171,7 +171,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
-    private var inputInjector: InputInjector?
+    private let localInputMonitor = LocalInputMonitor()
+    private var remoteInputOwnership = RemoteInputOwnership()
+    private var loggedRemoteInput = false
+    private var inputInjector: InputInjector? {
+        willSet { inputInjector?.releaseRemoteInput() }
+    }
 
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
@@ -426,20 +431,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 canvasNeedsRebuild = false
                 await reconfigure(latest)
             }
+        }
 
-            // Touch back-channel (Milestone 3). Needs Accessibility trust;
-            // streaming works without it, so don't interrupt with a prompt —
-            // the permission panel's Grant button asks when the user is ready.
-            if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for touch input")
-                // Event posting is trust-checked per-post, so it starts working
-                // the moment the user grants — poll just to log/report it.
-                while !AXIsProcessTrusted() {
-                    try await Task.sleep(for: .seconds(2))
-                    if stopped { return }
-                }
-                Log.info("Accessibility permission granted — touch input live")
+        startLocalInputMonitor()
+
+        // Both mirror and extend accept input from a receiver. Keep the video
+        // running while the user grants Accessibility through the permission panel.
+        if !AXIsProcessTrusted() {
+            await status("\(mode == .extend ? "Extending" : "Mirroring") — grant Accessibility for remote input")
+            while !AXIsProcessTrusted() {
+                try await Task.sleep(for: .seconds(2))
+                if stopped { return }
             }
+            Log.info("Accessibility permission granted — remote input live")
+            startLocalInputMonitor()
         }
     }
 
@@ -947,7 +952,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
 
         try ensureActiveDisplay(vd)
-        inputInjector = InputInjector(displayID: vd.displayID)
         try await startCapture(display: captureDisplay,
                                sourcePixelsWide: vd.pixelsWide,
                                sourcePixelsHigh: vd.pixelsHigh,
@@ -1116,10 +1120,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                sourcePixelsHigh: pointsHigh * scale,
                                receiver: info)
         try ensureActiveDisplay(vd)
-        if dimensionsChanged {
-            inputInjector = InputInjector(displayID: vd.displayID)
-        }
-
         if dimensionsChanged, UserDefaults.standard.bool(forKey: "testPattern") {
             let id = vd.displayID
             Task { @MainActor in TestPattern.show(on: id) }
@@ -1149,7 +1149,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                    sourcePixelsHigh: canvas.pixelsHigh,
                                    receiver: info)
             try ensureActiveDisplay(vd)
-            inputInjector = InputInjector(displayID: vd.displayID)
             return true
         } catch {
             try ensureActiveDisplay(vd)
@@ -1407,6 +1406,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             throw error
         }
+        // Bind input to the display actually captured in either mode, also
+        // after display changes and capture recovery. Replacing it releases
+        // any input held against the previous capture target.
+        queue.sync {
+            inputInjector = InputInjector(displayID: display.displayID)
+            loggedRemoteInput = false
+        }
+        Log.info("remote input target: display \(display.displayID), mode \(mode.rawValue), accessibility=\(AXIsProcessTrusted())")
         captureDisplayID = display.displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         startCursorEcho()
@@ -1433,6 +1440,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.mirrorScreenObserver = nil
             }
         }
+        DispatchQueue.main.async { self.localInputMonitor.stop() }
         stopped = true
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
@@ -1440,6 +1448,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorImageTimer = nil
         stream?.stopCapture { _ in }
         stream = nil
+        inputInjector?.releaseRemoteInput()
         connection?.cancel()
         connection = nil
         // Cursor-channel state is confined to `queue` (the 120Hz poll and the
@@ -1486,6 +1495,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connectionReady = false
             self.currentPathDirectLink = false   // the new transport re-classifies
             self.dialGeneration += 1   // a dial still in flight must not adopt
+            self.inputInjector?.releaseRemoteInput()
             self.connection?.cancel()
             self.connection = nil
             self.closeCursorChannel()
@@ -1751,6 +1761,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lastCursorSent = (-1, -1, false)
             self.cursorSessionGeneration = readyGeneration
         }
+        remoteInputOwnership.reset()
         everConnected = true
         awaitingWake = false
         consecutiveRefusals = 0
@@ -2180,6 +2191,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         currentPathDirectLink = false
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
+        inputInjector?.releaseRemoteInput()
         connection?.cancel()
         connection = nil
         closeCursorChannel()   // rebuilt from the next hello
@@ -2534,6 +2546,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             )
             return
         }
+        // Block stale remote input immediately, before the receiver learns
+        // that a local action has taken control back.
+        if ["mouse", "key"].contains(type) || (type == "scroll" && obj["inputEpoch"] != nil) {
+            guard remoteInputOwnership.accept(type: type, phase: obj["phase"] as? String,
+                                               epoch: obj["inputEpoch"] as? Int) else { return }
+        }
         switch type {
         case "ping":
             // Echo with our clock so the phone can estimate the offset
@@ -2616,6 +2634,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
+        case "mouse":
+            if let phase = obj["phase"] as? String,
+               let x = obj["x"] as? Double, let y = obj["y"] as? Double {
+                logRemoteInputIfNeeded()
+                inputInjector?.handleMouse(phase: phase, x: x, y: y,
+                    button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
+                    modifiers: obj["modifiers"] as? UInt64 ?? 0)
+            }
+        case "key":
+            if let phase = obj["phase"] as? String, let code = obj["keyCode"] as? Int {
+                logRemoteInputIfNeeded()
+                inputInjector?.handleKey(phase: phase, keyCode: code,
+                    modifiers: obj["modifiers"] as? UInt64 ?? 0,
+                    repeatKey: obj["repeat"] as? Bool ?? false)
+            }
+        case "inputReset":
+            if let epoch = obj["inputEpoch"] as? Int, epoch != remoteInputOwnership.epoch { return }
+            remoteInputOwnership.reset()
+            inputInjector?.releaseRemoteInput()
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
@@ -2631,7 +2668,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "scroll":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                inputInjector?.handleScroll(dx: dx, dy: dy)
+                inputInjector?.handleScroll(dx: dx, dy: dy, modifiers: obj["modifiers"] as? UInt64 ?? 0)
             }
         case "pencil":
             if let phase = obj["phase"] as? String,
@@ -3237,12 +3274,33 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    private func startLocalInputMonitor() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.localInputMonitor.start { [weak self] in
+                self?.queue.async { [weak self] in
+                    guard let self, !self.stopped, self.remoteInputOwnership.localActivity() else { return }
+                    self.inputInjector?.releaseRemoteInput()
+                    self.sendJSONFrame("{\"type\":\"inputReleased\",\"inputEpoch\":\(self.remoteInputOwnership.epoch)}")
+                    Log.info("local sender input took control back from receiver")
+                }
+            }
+        }
+    }
+
+    /// One diagnostic per capture target, without recording keys or coordinates.
+    private func logRemoteInputIfNeeded() {
+        guard !loggedRemoteInput else { return }
+        loggedRemoteInput = true
+        Log.info("receiver input arrived: targetReady=\(inputInjector != nil), accessibility=\(AXIsProcessTrusted())")
+    }
+
     // MARK: - Version handshake (issue #132)
 
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer)}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"inputCaps\":[\"mouse\",\"keyboard\"],\"inputEpoch\":\(remoteInputOwnership.epoch)}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the
