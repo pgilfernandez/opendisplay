@@ -657,13 +657,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Exclude every OpenDisplay virtual monitor, including sibling sessions,
     /// so a headless mirror never captures an unrelated extended desktop.
     private func mirrorReference(in content: SCShareableContent) -> SCDisplay? {
-        let available = content.displays.filter { CGDisplayIsOnline($0.displayID) != 0 }
+        let available = content.displays.filter {
+            CGDisplayIsOnline($0.displayID) != 0 && !isHeadlessPlaceholder($0.displayID)
+        }
         let virtuals = Set(available.filter {
             CGDisplayVendorNumber($0.displayID) == 0x5043 || $0.displayID == virtualDisplay?.displayID
         }.map(\.displayID))
         guard let id = MirrorDisplayPolicy.referenceDisplay(available: available.map(\.displayID),
             main: CGMainDisplayID(), openDisplayVirtuals: virtuals) else { return nil }
         return available.first { $0.displayID == id }
+    }
+
+    private func isHeadlessPlaceholder(_ display: CGDirectDisplayID) -> Bool {
+        MirrorDisplayPolicy.isHeadlessPlaceholder(vendor: CGDisplayVendorNumber(display),
+                                                  model: CGDisplayModelNumber(display))
     }
 
     private func hasMirrorReferenceOnline() -> Bool {
@@ -673,6 +680,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return false }
         return displays.prefix(Int(count)).contains {
             $0 != virtualDisplay?.displayID && CGDisplayVendorNumber($0) != 0x5043
+                && !isHeadlessPlaceholder($0)
         }
     }
 

@@ -1,6 +1,12 @@
 import XCTest
 
 final class MirrorDisplayPolicyTests: XCTestCase {
+    func testWindowServerHeadlessPlaceholderIsNotPhysical() {
+        XCTAssertTrue(MirrorDisplayPolicy.isHeadlessPlaceholder(vendor: 0x756E6B6E, model: 0x76697274))
+        XCTAssertFalse(MirrorDisplayPolicy.isHeadlessPlaceholder(vendor: 0x610, model: 0x76697274))
+        XCTAssertFalse(MirrorDisplayPolicy.isHeadlessPlaceholder(vendor: 0x756E6B6E, model: 1))
+    }
+
     func testNoDisplaysRequiresVirtualDesktop() {
         XCTAssertNil(MirrorDisplayPolicy.referenceDisplay(available: [], main: 0, openDisplayVirtuals: []))
     }

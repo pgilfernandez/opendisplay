@@ -2,6 +2,12 @@ import CoreGraphics
 
 /// Mirror an existing desktop when available; otherwise own a virtual one.
 enum MirrorDisplayPolicy {
+    /// WindowServer can expose a synthetic 1080p desktop on a headless Mac.
+    /// Its `unkn` / `virt` identity is not a physical mirror source.
+    static func isHeadlessPlaceholder(vendor: UInt32, model: UInt32) -> Bool {
+        vendor == 0x756E6B6E && model == 0x76697274
+    }
+
     static func referenceDisplay(available: [CGDirectDisplayID],
                                  main: CGDirectDisplayID,
                                  openDisplayVirtuals: Set<CGDirectDisplayID>) -> CGDirectDisplayID? {
